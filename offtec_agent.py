@@ -325,11 +325,24 @@ def tool_exec(name):
         return f"Não posso executar {name} (precisa existir e ser .py)."
     if not Confirm.ask(f"Executar [bold]{name}[/]?", default=True):
         return f"O usuário recusou executar {name}."
+    try:
+        interactive = "input(" in p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        interactive = False
+    if interactive:
+        # programa que pede dados: roda direto no terminal para você poder digitar
+        console.print("[#8a8fa3]Programa interativo: rodando direto no terminal (Ctrl+C para parar).[/]")
+        try:
+            rc = subprocess.run([sys.executable, str(p)], cwd=WORKSPACE).returncode
+        except KeyboardInterrupt:
+            rc = -2
+        console.print(f"[#8a8fa3]▶ {name} terminou (código {rc}).[/]")
+        return f"{name} é interativo e foi executado direto no terminal (código {rc}); a saída não foi capturada."
     t0 = time.time()
     try:
         r = subprocess.run(
             [sys.executable, str(p)], cwd=WORKSPACE, capture_output=True,
-            text=True, timeout=EXEC_TIMEOUT,
+            text=True, timeout=EXEC_TIMEOUT, stdin=subprocess.DEVNULL,
         )
         out, err, code = r.stdout, r.stderr, r.returncode
     except subprocess.TimeoutExpired:
