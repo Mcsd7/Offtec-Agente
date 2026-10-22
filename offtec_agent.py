@@ -14,6 +14,7 @@ Instalação:
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -43,6 +44,15 @@ WORKSPACE.mkdir(parents=True, exist_ok=True)
 MAX_ROUNDS = 4          # quantas voltas ação -> resultado -> modelo
 MAX_HISTORY = 24        # mensagens mantidas no contexto
 EXEC_TIMEOUT = 30       # segundos
+
+# linguagens suportadas: realce de sintaxe, execução e detecção de programa interativo
+LEXERS = {".py": "python", ".sh": "bash", ".c": "c", ".html": "html", ".txt": "text"}
+RUNNABLE = {".py", ".sh", ".c"}
+RE_INTERACTIVE = {
+    ".py": re.compile(r"input\("),
+    ".sh": re.compile(r"(?m)(^\s*|[;&|]\s*)read\s"),
+    ".c": re.compile(r"\b(scanf|getchar|fgets|gets|getline)\s*\("),
+}
 
 console = Console()
 
@@ -119,10 +129,10 @@ def splash():
     cmds.add_column(style="bold #c85bff", no_wrap=True)
     cmds.add_column(style="#c9cdd8")
     cmds.add_row("/ajuda", "lista de comandos")
-    cmds.add_row("/criar <arq> <desc>", "cria um .py")
+    cmds.add_row("/criar <arq> <desc>", "py sh c html txt")
     cmds.add_row("/ls", "arquivos da pasta")
     cmds.add_row("/ler <arq>", "mostra um arquivo")
-    cmds.add_row("/rodar <arq>", "executa um .py")
+    cmds.add_row("/rodar <arq>", "executa .py .sh .c")
     cmds.add_row("/limpar", "zera a conversa")
     cmds.add_row("/sair", "encerra")
 
@@ -189,7 +199,7 @@ Regras:
 - Depois de [[EXEC]] ou [[LER]], PARE de escrever e espere o resultado. Nunca invente resultados.
 - Use as marcas só quando for realmente criar, ler, executar ou listar.
 - Nunca coloque o conteúdo do arquivo dentro de ``` ao usar [[CRIAR]].
-- Só execute arquivos .py. Nomes de arquivo sem espaços e sem pastas.
+- Só execute arquivos .py, .sh ou .c. Nomes de arquivo sem espaços e sem pastas.
 - Depois de [[EXEC]] você receberá o resultado; analise-o e diga se passou ou o que corrigir.
 - Para testar, crie um arquivo de teste simples (assert/print) e execute.
 """
@@ -209,10 +219,10 @@ def is_looping(text):
     counts = {}
     for ln in text.splitlines():
         ln = ln.strip()
-        if ln.startswith("[["):
+        if re.match(r"\[\[(CRIAR|LER|EXEC|LISTAR|FIM)", ln):
             limit = 4
         elif len(ln) > 12:
-            limit = 5
+            limit = 8
         else:
             continue
         counts[ln] = counts.get(ln, 0) + 1
@@ -294,7 +304,7 @@ def tool_ler(name):
         text = p.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return f"Erro ao ler {name}: {e}"
-    console.print(Panel(Syntax(text, "python", theme="monokai", word_wrap=True),
+    console.print(Panel(Syntax(text, LEXERS.get(p.suffix.lower(), "text"), theme="monokai", word_wrap=True),
                         title=f"📄 {name}", border_style="#5c8dff"))
     return f"Conteúdo de {name}:\n{text[:3000]}"
 
@@ -307,7 +317,7 @@ def tool_criar(name, content):
     code = strip_fences(content)
     if not code.strip():
         return f"Erro: o conteúdo de {name} veio vazio. Escreva o código completo entre [[CRIAR {name}]] e [[FIM]]."
-    console.print(Panel(Syntax(code, "python", theme="monokai", word_wrap=True),
+    console.print(Panel(Syntax(code, LEXERS.get(p.suffix.lower(), "text"), theme="monokai", word_wrap=True),
                         title=f"✏️  Criar {name}", border_style="#c85bff"))
     if not Confirm.ask(f"Criar/sobrescrever [bold]{name}[/]?", default=True):
         return f"O usuário recusou criar {name}."
@@ -316,24 +326,52 @@ def tool_criar(name, content):
     return f"Arquivo {name} criado com sucesso."
 
 
-def tool_exec(name):
+def build_command(p):
+    """Devolve (comando, erro). Para C, compila antes."""
+    ext = p.suffix.lower()
+    if ext == ".py":
+        return [sys.executable, str(p)], None
+    if ext == ".sh":
+        return ["bash", str(p)], None
+    cc = shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        return None, "Compilador de C não encontrado. Instale com: pkg install clang"
+    out = p.with_suffix(".out")
+    try:
+        r = subprocess.run(
+            [cc, str(p), "-o", str(out), "-lm"], cwd=WORKSPACE, capture_output=True,
+            text=True, timeout=60, stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "Tempo esgotado na compilação (60s)."
+    if r.returncode != 0:
+        return None, "Erro de compilação:\n" + (r.stderr or r.stdout).strip()[:1500]
+    return [str(out)], None
+
+
+def tool_exec(name, confirm=True):
     try:
         p = safe_path(name)
     except Exception as e:
         return f"Erro: {e}"
-    if p.suffix != ".py" or not p.exists():
-        return f"Não posso executar {name} (precisa existir e ser .py)."
-    if not Confirm.ask(f"Executar [bold]{name}[/]?", default=True):
+    ext = p.suffix.lower()
+    if ext not in RUNNABLE or not p.exists():
+        return f"Não posso executar {name} (precisa existir e ser .py, .sh ou .c)."
+    if confirm and not Confirm.ask(f"Executar [bold]{name}[/]?", default=True):
         return f"O usuário recusou executar {name}."
+    cmd, err = build_command(p)
+    if err:
+        console.print(Panel(err, title=f"✖ {name}", border_style="red"))
+        return f"Não foi possível executar {name}: {err}"
     try:
-        interactive = "input(" in p.read_text(encoding="utf-8", errors="replace")
+        interactive = bool(RE_INTERACTIVE[ext].search(p.read_text(encoding="utf-8", errors="replace")))
     except Exception:
         interactive = False
     if interactive:
         # programa que pede dados: roda direto no terminal para você poder digitar
         console.print("[#8a8fa3]Programa interativo: rodando direto no terminal (Ctrl+C para parar).[/]")
         try:
-            rc = subprocess.run([sys.executable, str(p)], cwd=WORKSPACE).returncode
+            rc = subprocess.run(cmd, cwd=WORKSPACE).returncode
         except KeyboardInterrupt:
             rc = -2
         console.print(f"[#8a8fa3]▶ {name} terminou (código {rc}).[/]")
@@ -341,7 +379,7 @@ def tool_exec(name):
     t0 = time.time()
     try:
         r = subprocess.run(
-            [sys.executable, str(p)], cwd=WORKSPACE, capture_output=True,
+            cmd, cwd=WORKSPACE, capture_output=True,
             text=True, timeout=EXEC_TIMEOUT, stdin=subprocess.DEVNULL,
         )
         out, err, code = r.stdout, r.stderr, r.returncode
@@ -353,6 +391,20 @@ def tool_exec(name):
     console.print(Panel(body[:2000], title=f"▶ {name}  •  código {code}  •  {dt:.1f}s",
                         border_style=color))
     return f"Resultado de {name} (código de saída {code}):\n{body[:2000]}"
+
+
+def open_html(name):
+    try:
+        p = safe_path(name)
+    except Exception as e:
+        console.print(f"[red]{e}[/]")
+        return
+    console.print(f"[#8a8fa3]Arquivo: file://{p}[/]")
+    opener = shutil.which("termux-open")
+    if opener:
+        subprocess.run([opener, str(p)])
+    else:
+        console.print("[#8a8fa3]Abra o caminho acima no navegador do celular.[/]")
 
 
 def run_actions(text):
@@ -378,45 +430,69 @@ def run_actions(text):
 
 
 def fallback_save(user, reply):
-    """Se o modelo respondeu só com um bloco ```python, salva no arquivo citado pelo usuário."""
-    fn = re.search(r"([\w\-]+\.py)", user)
-    code = re.search(r"```(?:python|py)?\s*\n(.*?)```", reply, re.S)
+    """Se o modelo respondeu só com um bloco de código, salva no arquivo citado pelo usuário."""
+    exts = "|".join(e.lstrip(".") for e in LEXERS)
+    fn = re.search(rf"([\w\-]+\.(?:{exts}))\b", user, re.I)
+    code = re.search(r"```[a-zA-Z0-9]*\s*\n(.*?)```", reply, re.S)
     if fn and code and code.group(1).strip():
         return tool_criar(fn.group(1), code.group(1))
     return None
 
 
-CREATE_PROMPT = (
-    "Você escreve código Python. Responda SOMENTE com o código completo do arquivo, "
-    "sem explicações, sem marcas e sem texto antes ou depois. "
-    "Use apenas a biblioteca padrão do Python."
-)
+_ONLY = "sem explicações, sem marcas e sem texto antes ou depois."
+CREATE_PROMPTS = {
+    ".py": "Você escreve código Python. Responda SOMENTE com o código completo do arquivo, "
+           + _ONLY + " Use apenas a biblioteca padrão do Python.",
+    ".sh": "Você escreve scripts Bash para o Termux (Android). Responda SOMENTE com o script "
+           "completo, começando com #!/usr/bin/env bash, " + _ONLY,
+    ".c": "Você escreve programas em C (padrão C99) para compilar com clang no Termux. "
+          "Responda SOMENTE com o código completo, com os #include e a função main, " + _ONLY,
+    ".html": "Você escreve páginas web. Responda SOMENTE com um arquivo HTML completo e "
+             "autocontido (CSS e JavaScript dentro do próprio arquivo, sem bibliotecas externas), "
+             + _ONLY,
+    ".txt": "Você escreve textos em português. Responda SOMENTE com o conteúdo do arquivo, "
+            "sem comentários extras e sem blocos de código.",
+}
 
 
 def cmd_criar(arg):
-    """/criar nome.py descrição -> pede só o código ao modelo e salva (com confirmação)."""
+    """/criar nome.ext descrição -> pede só o conteúdo ao modelo e salva (com confirmação)."""
     parts = arg.split(maxsplit=1)
     name = parts[0]
     desc = parts[1].strip() if len(parts) > 1 else ""
-    if not re.fullmatch(r"[\w\-]+(\.py)?", name) or not desc:
-        console.print("[yellow]Uso: /criar nome.py descrição do que o programa faz[/]")
+    if not re.fullmatch(r"[\w\-]+(\.\w+)?", name) or not desc:
+        console.print("[yellow]Uso: /criar nome.ext descrição  (tipos: py, sh, c, html, txt)[/]")
         return
-    if not name.endswith(".py"):
+    if "." not in name:
         name += ".py"
+    ext = Path(name).suffix.lower()
+    if ext not in CREATE_PROMPTS:
+        console.print("[yellow]Tipo não suportado. Use: .py, .sh, .c, .html ou .txt[/]")
+        return
+    name = Path(name).stem + ext
     msgs = [
-        {"role": "system", "content": CREATE_PROMPT},
+        {"role": "system", "content": CREATE_PROMPTS[ext]},
         {"role": "user", "content": f"Escreva o arquivo {name}: {desc}"},
     ]
-    console.print("[bold #c85bff]◆ OFFTEC[/] [#8a8fa3]gerando código...[/]")
+    console.print("[bold #c85bff]◆ OFFTEC[/] [#8a8fa3]gerando conteúdo...[/]")
     reply = chat_stream(msgs)
     if not reply:
         return
-    m = re.search(r"```(?:python|py)?\s*\n(.*?)```", reply, re.S)
-    code = m.group(1) if m else reply
-    code = re.sub(r"^\s*```[a-zA-Z0-9]*\n", "", code)
+    if ext == ".txt":
+        code = reply
+    else:
+        m = re.search(r"```[a-zA-Z0-9]*\s*\n(.*?)```", reply, re.S)
+        code = m.group(1) if m else reply
+        code = re.sub(r"^\s*```[a-zA-Z0-9]*\n", "", code)
     result = tool_criar(name, code)
-    if "criado com sucesso" in result and Confirm.ask(f"Executar [bold]{name}[/] agora?", default=False):
-        tool_exec(name)
+    if "criado com sucesso" not in result:
+        return
+    if ext in RUNNABLE:
+        if Confirm.ask(f"Executar [bold]{name}[/] agora?", default=False):
+            tool_exec(name, confirm=False)
+    elif ext == ".html":
+        if Confirm.ask(f"Abrir [bold]{name}[/] no navegador?", default=False):
+            open_html(name)
 
 
 # ───────────────────────── Loop principal ─────────────────────────
@@ -433,7 +509,7 @@ def handle_command(cmd, history):
         if arg:
             cmd_criar(arg)
         else:
-            console.print("[yellow]Uso: /criar nome.py descrição[/]")
+            console.print("[yellow]Uso: /criar nome.ext descrição  (py, sh, c, html, txt)[/]")
     elif c == "/ls":
         console.print(Panel(tool_listar(), border_style="#5c8dff"))
     elif c == "/ler" and arg:
