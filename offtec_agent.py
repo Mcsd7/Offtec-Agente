@@ -38,7 +38,7 @@ MODEL = os.environ.get("OFFTEC_MODEL", "llama3.2:1b-instruct-q4_K_M")
 HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 if not HOST.startswith("http"):
     HOST = "http://" + HOST
-WORKSPACE = Path(os.environ.get("OFFTEC_WORKSPACE", Path.home() / "offtec_workspace"))
+WORKSPACE = Path(os.environ.get("OFFTEC_WORKSPACE", Path.home() / "offtec_workspace")).expanduser()
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 MAX_ROUNDS = 4          # quantas voltas ação -> resultado -> modelo
 MAX_HISTORY = 24        # mensagens mantidas no contexto
@@ -176,7 +176,15 @@ Você trabalha dentro de uma pasta de trabalho. Para agir, use EXATAMENTE estas 
 [[EXEC nome.py]]
 [[LISTAR]]
 
+Exemplo correto (o nome vai DENTRO dos colchetes e o código fica entre CRIAR e FIM):
+[[CRIAR soma.py]]
+a = int(input("a: "))
+b = int(input("b: "))
+print(a + b)
+[[FIM]]
+
 Regras:
+- Faça UMA ação por resposta e nunca repita marcas.
 - Use as marcas só quando for realmente criar, ler, executar ou listar.
 - Nunca coloque o conteúdo do arquivo dentro de ``` ao usar [[CRIAR]].
 - Só execute arquivos .py. Nomes de arquivo sem espaços e sem pastas.
@@ -190,6 +198,23 @@ RE_EXEC = re.compile(r"\[\[EXEC\s+([^\]\s]+)\]\]")
 RE_LISTAR = re.compile(r"\[\[LISTAR\]\]")
 
 
+def is_looping(text):
+    """Detecta resposta repetitiva (modelo pequeno travado em loop)."""
+    counts = {}
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if ln.startswith("[["):
+            limit = 4
+        elif len(ln) > 12:
+            limit = 5
+        else:
+            continue
+        counts[ln] = counts.get(ln, 0) + 1
+        if counts[ln] >= limit:
+            return True
+    return False
+
+
 def chat_stream(messages):
     """Faz streaming da resposta do Ollama e devolve o texto completo."""
     payload = json.dumps(
@@ -197,7 +222,7 @@ def chat_stream(messages):
             "model": MODEL,
             "messages": messages,
             "stream": True,
-            "options": {"temperature": 0.3, "num_ctx": 4096},
+            "options": {"temperature": 0.2, "num_ctx": 4096, "num_predict": 700, "repeat_penalty": 1.2},
         }
     ).encode()
     req = urllib.request.Request(
@@ -214,6 +239,9 @@ def chat_stream(messages):
                 if piece:
                     full.append(piece)
                     console.print(piece, end="", markup=False, highlight=False, style="#e6e9f2")
+                    if "\n" in piece and is_looping("".join(full)):
+                        console.print("\n[yellow]⚠ Resposta repetitiva, interrompi.[/]")
+                        break
                 if chunk.get("done"):
                     break
     except urllib.error.URLError:
@@ -264,6 +292,8 @@ def tool_criar(name, content):
     except Exception as e:
         return f"Erro: {e}"
     code = strip_fences(content)
+    if not code.strip():
+        return f"Erro: o conteúdo de {name} veio vazio. Escreva o código completo entre [[CRIAR {name}]] e [[FIM]]."
     console.print(Panel(Syntax(code, "python", theme="monokai", word_wrap=True),
                         title=f"✏️  Criar {name}", border_style="#c85bff"))
     if not Confirm.ask(f"Criar/sobrescrever [bold]{name}[/]?", default=True):
@@ -301,18 +331,33 @@ def tool_exec(name):
 
 def run_actions(text):
     """Executa as marcas encontradas e devolve os resultados (lista de str)."""
+    # aceita também [[CRIAR]] nome.py (formato errado comum em modelos pequenos)
+    text = re.sub(r"\[\[(CRIAR|LER|EXEC)\]\]\s*([\w.\-]+)", r"[[\1 \2]]", text)
     results = []
+    done = set()
     for name, content in RE_CRIAR.findall(text):
+        if name in done:
+            continue
+        done.add(name)
         results.append(tool_criar(name, content))
-    for name in RE_LER.findall(text):
+    for name in dict.fromkeys(RE_LER.findall(text)):
         results.append(tool_ler(name))
     if RE_LISTAR.search(text):
         r = tool_listar()
         console.print(Panel(r, border_style="#5c8dff", title="📁 pasta"))
         results.append(r)
-    for name in RE_EXEC.findall(text):
+    for name in dict.fromkeys(RE_EXEC.findall(text)):
         results.append(tool_exec(name))
     return results
+
+
+def fallback_save(user, reply):
+    """Se o modelo respondeu só com um bloco ```python, salva no arquivo citado pelo usuário."""
+    fn = re.search(r"([\w\-]+\.py)", user)
+    code = re.search(r"```(?:python|py)?\s*\n(.*?)```", reply, re.S)
+    if fn and code and code.group(1).strip():
+        return tool_criar(fn.group(1), code.group(1))
+    return None
 
 
 # ───────────────────────── Loop principal ─────────────────────────
@@ -365,6 +410,8 @@ def main():
             history.append({"role": "assistant", "content": reply})
             results = run_actions(reply)
             if not results:
+                if fallback_save(user, reply):
+                    console.print("[#8a8fa3]Salvei o código do bloco da resposta.[/]")
                 break
             history.append({
                 "role": "user",
