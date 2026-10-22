@@ -119,6 +119,7 @@ def splash():
     cmds.add_column(style="bold #c85bff", no_wrap=True)
     cmds.add_column(style="#c9cdd8")
     cmds.add_row("/ajuda", "lista de comandos")
+    cmds.add_row("/criar <arq> <desc>", "cria um .py")
     cmds.add_row("/ls", "arquivos da pasta")
     cmds.add_row("/ler <arq>", "mostra um arquivo")
     cmds.add_row("/rodar <arq>", "executa um .py")
@@ -372,6 +373,39 @@ def fallback_save(user, reply):
     return None
 
 
+CREATE_PROMPT = (
+    "Você escreve código Python. Responda SOMENTE com o código completo do arquivo, "
+    "sem explicações, sem marcas e sem texto antes ou depois. "
+    "Use apenas a biblioteca padrão do Python."
+)
+
+
+def cmd_criar(arg):
+    """/criar nome.py descrição -> pede só o código ao modelo e salva (com confirmação)."""
+    parts = arg.split(maxsplit=1)
+    name = parts[0]
+    desc = parts[1].strip() if len(parts) > 1 else ""
+    if not re.fullmatch(r"[\w\-]+(\.py)?", name) or not desc:
+        console.print("[yellow]Uso: /criar nome.py descrição do que o programa faz[/]")
+        return
+    if not name.endswith(".py"):
+        name += ".py"
+    msgs = [
+        {"role": "system", "content": CREATE_PROMPT},
+        {"role": "user", "content": f"Escreva o arquivo {name}: {desc}"},
+    ]
+    console.print("[bold #c85bff]◆ OFFTEC[/] [#8a8fa3]gerando código...[/]")
+    reply = chat_stream(msgs)
+    if not reply:
+        return
+    m = re.search(r"```(?:python|py)?\s*\n(.*?)```", reply, re.S)
+    code = m.group(1) if m else reply
+    code = re.sub(r"^\s*```[a-zA-Z0-9]*\n", "", code)
+    result = tool_criar(name, code)
+    if "criado com sucesso" in result and Confirm.ask(f"Executar [bold]{name}[/] agora?", default=False):
+        tool_exec(name)
+
+
 # ───────────────────────── Loop principal ─────────────────────────
 
 def handle_command(cmd, history):
@@ -382,6 +416,11 @@ def handle_command(cmd, history):
         sys.exit(0)
     elif c == "/ajuda":
         splash()
+    elif c == "/criar":
+        if arg:
+            cmd_criar(arg)
+        else:
+            console.print("[yellow]Uso: /criar nome.py descrição[/]")
     elif c == "/ls":
         console.print(Panel(tool_listar(), border_style="#5c8dff"))
     elif c == "/ler" and arg:
