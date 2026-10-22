@@ -38,7 +38,7 @@ MODEL = os.environ.get("OFFTEC_MODEL", "llama3.2:1b-instruct-q4_K_M")
 HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 if not HOST.startswith("http"):
     HOST = "http://" + HOST
-WORKSPACE = Path(os.environ.get("OFFTEC_WORKSPACE", Path.home() / "offtec_workspace")).expanduser()
+WORKSPACE = Path(os.environ.get("OFFTEC_WORKSPACE", Path(__file__).resolve().parent / "workspace")).expanduser()
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 MAX_ROUNDS = 4          # quantas voltas ação -> resultado -> modelo
 MAX_HISTORY = 24        # mensagens mantidas no contexto
