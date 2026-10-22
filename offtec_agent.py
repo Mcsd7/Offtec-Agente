@@ -185,6 +185,7 @@ print(a + b)
 
 Regras:
 - Faça UMA ação por resposta e nunca repita marcas.
+- Depois de [[EXEC]] ou [[LER]], PARE de escrever e espere o resultado. Nunca invente resultados.
 - Use as marcas só quando for realmente criar, ler, executar ou listar.
 - Nunca coloque o conteúdo do arquivo dentro de ``` ao usar [[CRIAR]].
 - Só execute arquivos .py. Nomes de arquivo sem espaços e sem pastas.
@@ -192,7 +193,11 @@ Regras:
 - Para testar, crie um arquivo de teste simples (assert/print) e execute.
 """
 
-RE_CRIAR = re.compile(r"\[\[CRIAR\s+([^\]\s]+)\]\]\s*\n(.*?)\[\[FIM\]\]", re.S)
+RE_CRIAR = re.compile(r"\[\[CRIAR\s+([^\]\s]+)\]\]\s*\n(.*?)(?=\[\[FIM\]\]|\[\[(?:CRIAR|LER|EXEC|LISTAR)|\Z)", re.S)
+# fim da ação: o modelo deve parar aqui e esperar o resultado (evita resultados inventados)
+RE_STOP = re.compile(
+    r"\[\[FIM\]\]|\[\[LISTAR\]\]|\[\[(?:EXEC|LER) [\w.\-]+\]\]|\[\[(?:EXEC|LER)\]\] *[\w.\-]+[ \t]*\n"
+)
 RE_LER = re.compile(r"\[\[LER\s+([^\]\s]+)\]\]")
 RE_EXEC = re.compile(r"\[\[EXEC\s+([^\]\s]+)\]\]")
 RE_LISTAR = re.compile(r"\[\[LISTAR\]\]")
@@ -239,7 +244,12 @@ def chat_stream(messages):
                 if piece:
                     full.append(piece)
                     console.print(piece, end="", markup=False, highlight=False, style="#e6e9f2")
-                    if "\n" in piece and is_looping("".join(full)):
+                    joined = "".join(full)
+                    m_stop = RE_STOP.search(joined)
+                    if m_stop:
+                        full = [joined[: m_stop.end()]]
+                        break
+                    if "\n" in piece and is_looping(joined):
                         console.print("\n[yellow]⚠ Resposta repetitiva, interrompi.[/]")
                         break
                 if chunk.get("done"):
@@ -267,7 +277,9 @@ def safe_path(name):
 def strip_fences(code):
     code = code.strip("\n")
     m = re.match(r"^```[a-zA-Z0-9]*\n(.*?)\n?```\s*$", code, re.S)
-    return (m.group(1) if m else code).rstrip() + "\n"
+    body = (m.group(1) if m else code).rstrip()
+    body = re.sub(r"\n?```\s*$", "", body)
+    return body.rstrip() + "\n"
 
 
 def tool_listar():
@@ -400,6 +412,7 @@ def main():
             continue
 
         history.append({"role": "user", "content": user})
+        last = None
         for _ in range(MAX_ROUNDS):
             msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + history[-MAX_HISTORY:]
             console.print("[bold #c85bff]◆ OFFTEC[/]")
@@ -413,6 +426,9 @@ def main():
                 if fallback_save(user, reply):
                     console.print("[#8a8fa3]Salvei o código do bloco da resposta.[/]")
                 break
+            if results == last:
+                break
+            last = results
             history.append({
                 "role": "user",
                 "content": "[RESULTADO DAS AÇÕES]\n" + "\n\n".join(results)
