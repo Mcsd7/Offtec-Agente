@@ -231,20 +231,24 @@ def is_looping(text):
     return False
 
 
-def chat_stream(messages):
+LAST = {"truncated": False}  # a última resposta foi cortada (limite ou loop)?
+
+
+def chat_stream(messages, num_predict=700):
     """Faz streaming da resposta do Ollama e devolve o texto completo."""
     payload = json.dumps(
         {
             "model": MODEL,
             "messages": messages,
             "stream": True,
-            "options": {"temperature": 0.2, "num_ctx": 4096, "num_predict": 700, "repeat_penalty": 1.2},
+            "options": {"temperature": 0.2, "num_ctx": 4096, "num_predict": num_predict, "repeat_penalty": 1.2},
         }
     ).encode()
     req = urllib.request.Request(
         HOST + "/api/chat", data=payload, headers={"Content-Type": "application/json"}
     )
     full = []
+    LAST["truncated"] = False
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
             for raw in resp:
@@ -262,8 +266,11 @@ def chat_stream(messages):
                         break
                     if "\n" in piece and is_looping(joined):
                         console.print("\n[yellow]⚠ Resposta repetitiva, interrompi.[/]")
+                        LAST["truncated"] = True
                         break
                 if chunk.get("done"):
+                    if chunk.get("done_reason") == "length":
+                        LAST["truncated"] = True
                     break
     except urllib.error.URLError:
         console.print("\n[red]Não consegui falar com o Ollama. Ele está rodando? (ollama serve)[/]")
@@ -439,7 +446,7 @@ def fallback_save(user, reply):
     return None
 
 
-_ONLY = "sem explicações, sem marcas e sem texto antes ou depois."
+_ONLY = "sem explicações, sem marcas e sem texto antes ou depois. Seja curto e simples, no máximo 50 linhas."
 CREATE_PROMPTS = {
     ".py": "Você escreve código Python. Responda SOMENTE com o código completo do arquivo, "
            + _ONLY + " Use apenas a biblioteca padrão do Python.",
@@ -453,6 +460,22 @@ CREATE_PROMPTS = {
     ".txt": "Você escreve textos em português. Responda SOMENTE com o conteúdo do arquivo, "
             "sem comentários extras e sem blocos de código.",
 }
+
+
+def syntax_error(p):
+    """Devolve a mensagem de erro de sintaxe (py/sh) ou None se estiver ok."""
+    ext = p.suffix.lower()
+    try:
+        if ext == ".sh":
+            r = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True, timeout=10)
+            return (r.stderr.strip() or "erro de sintaxe") if r.returncode else None
+        if ext == ".py":
+            compile(p.read_text(encoding="utf-8", errors="replace"), str(p), "exec")
+    except SyntaxError as e:
+        return f"{e.msg} (linha {e.lineno})"
+    except Exception:
+        return None
+    return None
 
 
 def cmd_criar(arg):
@@ -472,10 +495,10 @@ def cmd_criar(arg):
     name = Path(name).stem + ext
     msgs = [
         {"role": "system", "content": CREATE_PROMPTS[ext]},
-        {"role": "user", "content": f"Escreva o arquivo {name}: {desc}"},
+        {"role": "user", "content": f"Escreva o arquivo {name}. Faça exatamente isto, nada além disso: {desc}"},
     ]
     console.print("[bold #c85bff]◆ OFFTEC[/] [#8a8fa3]gerando conteúdo...[/]")
-    reply = chat_stream(msgs)
+    reply = chat_stream(msgs, num_predict=900)
     if not reply:
         return
     if ext == ".txt":
@@ -487,6 +510,13 @@ def cmd_criar(arg):
     result = tool_criar(name, code)
     if "criado com sucesso" not in result:
         return
+    err = syntax_error(safe_path(name))
+    if err:
+        console.print(Panel(err[:600], title=f"⚠ {name} tem erro de sintaxe", border_style="yellow"))
+        console.print("[yellow]O modelo gerou um código com problema. Tente de novo com uma descrição mais curta e direta.[/]")
+        return
+    if LAST["truncated"]:
+        console.print("[yellow]⚠ A resposta foi cortada pelo limite de tamanho; o arquivo pode estar incompleto.[/]")
     if ext in RUNNABLE:
         if Confirm.ask(f"Executar [bold]{name}[/] agora?", default=False):
             tool_exec(name, confirm=False)
