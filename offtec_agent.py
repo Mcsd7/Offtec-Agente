@@ -46,7 +46,8 @@ MAX_HISTORY = 24        # mensagens mantidas no contexto
 EXEC_TIMEOUT = 30       # segundos
 
 # linguagens suportadas: realce de sintaxe, execução e detecção de programa interativo
-LEXERS = {".py": "python", ".sh": "bash", ".c": "c", ".html": "html", ".txt": "text"}
+LEXERS = {".py": "python", ".sh": "bash", ".c": "c", ".html": "html", ".txt": "text",
+          ".css": "css", ".js": "javascript", ".md": "markdown"}
 RUNNABLE = {".py", ".sh", ".c"}
 RE_INTERACTIVE = {
     ".py": re.compile(r"input\("),
@@ -130,6 +131,8 @@ def splash():
     cmds.add_column(style="#c9cdd8")
     cmds.add_row("/ajuda", "lista de comandos")
     cmds.add_row("/criar <arq> <desc>", "py sh c html txt")
+    cmds.add_row("/app <nome> <desc>", "cria um app (pasta)")
+    cmds.add_row("/editar <arq|pasta>", "abre no vim/nano")
     cmds.add_row("/ls", "arquivos da pasta")
     cmds.add_row("/ler <arq>", "mostra um arquivo")
     cmds.add_row("/rodar <arq>", "executa .py .sh .c")
@@ -301,7 +304,7 @@ def strip_fences(code):
 
 
 def tool_listar():
-    files = sorted(p.name for p in WORKSPACE.iterdir())
+    files = sorted(p.name + ("/" if p.is_dir() else "") for p in WORKSPACE.iterdir())
     return "Arquivos: " + (", ".join(files) if files else "(pasta vazia)")
 
 
@@ -328,6 +331,7 @@ def tool_criar(name, content):
                         title=f"✏️  Criar {name}", border_style="#c85bff"))
     if not Confirm.ask(f"Criar/sobrescrever [bold]{name}[/]?", default=True):
         return f"O usuário recusou criar {name}."
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(code, encoding="utf-8")
     console.print(f"[green]✔ {name} salvo.[/]")
     return f"Arquivo {name} criado com sucesso."
@@ -346,7 +350,7 @@ def build_command(p):
     out = p.with_suffix(".out")
     try:
         r = subprocess.run(
-            [cc, str(p), "-o", str(out), "-lm"], cwd=WORKSPACE, capture_output=True,
+            [cc, str(p), "-o", str(out), "-lm"], cwd=p.parent, capture_output=True,
             text=True, timeout=60, stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
@@ -378,7 +382,7 @@ def tool_exec(name, confirm=True):
         # programa que pede dados: roda direto no terminal para você poder digitar
         console.print("[#8a8fa3]Programa interativo: rodando direto no terminal (Ctrl+C para parar).[/]")
         try:
-            rc = subprocess.run(cmd, cwd=WORKSPACE).returncode
+            rc = subprocess.run(cmd, cwd=p.parent).returncode
         except KeyboardInterrupt:
             rc = -2
         console.print(f"[#8a8fa3]▶ {name} terminou (código {rc}).[/]")
@@ -386,7 +390,7 @@ def tool_exec(name, confirm=True):
     t0 = time.time()
     try:
         r = subprocess.run(
-            cmd, cwd=WORKSPACE, capture_output=True,
+            cmd, cwd=p.parent, capture_output=True,
             text=True, timeout=EXEC_TIMEOUT, stdin=subprocess.DEVNULL,
         )
         out, err, code = r.stdout, r.stderr, r.returncode
@@ -462,6 +466,21 @@ CREATE_PROMPTS = {
 }
 
 
+def check_code(code, ext):
+    """Verifica a sintaxe de um texto de código (py/sh). Devolve o erro ou None."""
+    try:
+        if ext == ".sh":
+            r = subprocess.run(["bash", "-n"], input=code, capture_output=True, text=True, timeout=10)
+            return (r.stderr.strip() or "erro de sintaxe") if r.returncode else None
+        if ext == ".py":
+            compile(code, "<app>", "exec")
+    except SyntaxError as e:
+        return f"{e.msg} (linha {e.lineno})"
+    except Exception:
+        return None
+    return None
+
+
 def syntax_error(p):
     """Devolve a mensagem de erro de sintaxe (py/sh) ou None se estiver ok."""
     ext = p.suffix.lower()
@@ -513,16 +532,239 @@ def cmd_criar(arg):
     err = syntax_error(safe_path(name))
     if err:
         console.print(Panel(err[:600], title=f"⚠ {name} tem erro de sintaxe", border_style="yellow"))
-        console.print("[yellow]O modelo gerou um código com problema. Tente de novo com uma descrição mais curta e direta.[/]")
+        console.print("[yellow]O modelo gerou um código com problema. Tente de novo com uma descrição mais curta e direta, ou corrija à mão.[/]")
+        offer_editor([name])
         return
     if LAST["truncated"]:
         console.print("[yellow]⚠ A resposta foi cortada pelo limite de tamanho; o arquivo pode estar incompleto.[/]")
+    offer_editor([name])
     if ext in RUNNABLE:
         if Confirm.ask(f"Executar [bold]{name}[/] agora?", default=False):
             tool_exec(name, confirm=False)
     elif ext == ".html":
         if Confirm.ask(f"Abrir [bold]{name}[/] no navegador?", default=False):
             open_html(name)
+
+
+# ───────────────────────── Editor (vim / nano) ─────────────────────────
+
+EDITORS = ["vim", "nvim", "nano"]  # ordem de preferência (ou defina OFFTEC_EDITOR)
+EDITOR_HINTS = {"vim": ":wq salva e sai", "nvim": ":wq salva e sai", "vi": ":wq salva e sai",
+                "nano": "Ctrl+O salva, Ctrl+X sai"}
+
+
+def pick_editor(name=None):
+    if name:
+        cands = [name]
+    elif os.environ.get("OFFTEC_EDITOR"):
+        cands = [os.environ["OFFTEC_EDITOR"]]
+    else:
+        cands = EDITORS
+    for c in cands:
+        if shutil.which(c):
+            return c
+    return None
+
+
+def open_editor(rels, editor):
+    files = []
+    for r in rels:
+        try:
+            files.append(str(safe_path(r)))
+        except Exception as e:
+            console.print(f"[red]{e}[/]")
+    if not files:
+        return
+    cmd = [editor]
+    if len(files) > 1 and Path(editor).name in ("vim", "nvim", "vi"):
+        cmd.append("-p")  # abre cada arquivo em uma aba
+    cmd += files
+    try:
+        subprocess.run(cmd, cwd=WORKSPACE)
+    except (KeyboardInterrupt, FileNotFoundError):
+        pass
+    console.print("[#8a8fa3]Editor fechado.[/]")
+
+
+def offer_editor(rels):
+    ed = pick_editor()
+    if not ed:
+        return
+    hint = EDITOR_HINTS.get(Path(ed).name, "")
+    if Confirm.ask(f"Abrir o código no [bold]{ed}[/]? [#8a8fa3]({hint})[/]", default=False):
+        open_editor(rels, ed)
+
+
+def cmd_editar(arg):
+    """/editar arquivo|pasta [editor] -> abre no vim/nano."""
+    parts = arg.split()
+    ed = pick_editor(parts[1] if len(parts) > 1 else None)
+    if not ed:
+        console.print("[yellow]Editor não encontrado. Instale com: pkg install vim nano[/]")
+        return
+    try:
+        target = safe_path(parts[0])
+    except Exception as e:
+        console.print(f"[red]{e}[/]")
+        return
+    if target.is_dir():
+        root = WORKSPACE.resolve()
+        rels = [str(f.relative_to(root)) for f in sorted(target.iterdir())
+                if f.is_file() and f.suffix.lower() != ".out"]
+        if not rels:
+            console.print("[yellow]Pasta vazia.[/]")
+            return
+    else:
+        rels = [parts[0]]
+    open_editor(rels, ed)
+
+
+# ───────────────────────── Apps (vários arquivos) ─────────────────────────
+
+APP_ALIASES = {"python": "py", "bash": "sh", "html": "web", "site": "web"}
+_APP = "Responda SOMENTE com o conteúdo completo do arquivo, sem explicações, sem marcas e sem texto antes ou depois."
+APP_TYPES = {
+    "py": {
+        "label": "Python (terminal)",
+        "files": [("main.py",
+                   "Você escreve o arquivo principal main.py de um aplicativo de terminal em Python. "
+                   "Use só a biblioteca padrão, organize em funções e termine com "
+                   "if __name__ == \"__main__\": main(). Seja curto, no máximo 90 linhas. " + _APP)],
+        "run": "python main.py",
+    },
+    "sh": {
+        "label": "Bash (terminal)",
+        "files": [("main.sh",
+                   "Você escreve o script principal main.sh de um aplicativo de terminal em Bash para o Termux. "
+                   "Comece com #!/usr/bin/env bash e use funções. Seja curto, no máximo 70 linhas. " + _APP)],
+        "run": "bash main.sh",
+    },
+    "c": {
+        "label": "C (terminal)",
+        "files": [("main.c",
+                   "Você escreve o arquivo principal main.c de um aplicativo de terminal em C (padrão C99) "
+                   "para clang. Inclua os #include e a função main. Seja curto, no máximo 90 linhas. " + _APP)],
+        "run": "clang main.c -o app -lm && ./app",
+    },
+    "web": {
+        "label": "Web (HTML + CSS + JS)",
+        "files": [
+            ("index.html",
+             "Você escreve o index.html de um app web. Ligue o CSS com <link rel=\"stylesheet\" href=\"style.css\"> "
+             "e o JavaScript com <script src=\"script.js\"></script> antes de </body>. "
+             "Use ids e classes simples. No máximo 60 linhas. " + _APP),
+            ("style.css",
+             "Você escreve o style.css para o HTML fornecido. Use os ids e classes que existem no HTML. "
+             "Visual limpo, centralizado e bom em tela de celular. No máximo 60 linhas. " + _APP),
+            ("script.js",
+             "Você escreve o script.js para o HTML fornecido. Use exatamente os ids e classes do HTML, "
+             "JavaScript puro e sem bibliotecas. No máximo 60 linhas. " + _APP),
+        ],
+        "run": "abra index.html no navegador",
+    },
+}
+
+
+def extract_code(reply, ext):
+    if ext in (".txt", ".md"):
+        return reply
+    m = re.search(r"```[a-zA-Z0-9]*\s*\n(.*?)```", reply, re.S)
+    code = m.group(1) if m else reply
+    return re.sub(r"^\s*```[a-zA-Z0-9]*\n", "", code)
+
+
+def app_readme(name, desc, kind):
+    if kind == "web":
+        how = "Abra o arquivo `index.html` no navegador."
+    else:
+        how = "```\n" + APP_TYPES[kind]["run"] + "\n```"
+    return f"# {name}\n\n{desc}\n\nCriado com o OFFTEC Agent.\n\n## Como executar\n\n{how}\n"
+
+
+def cmd_app(arg):
+    """/app nome [tipo] descrição -> gera um app com vários arquivos em apps/nome/."""
+    usage = "[yellow]Uso: /app nome [tipo] descrição  (tipos: py, web, sh, c; padrão py)[/]"
+    parts = arg.split(maxsplit=2)
+    if len(parts) < 2:
+        console.print(usage)
+        return
+    name = parts[0]
+    kind = APP_ALIASES.get(parts[1].lower(), parts[1].lower())
+    if kind in APP_TYPES:
+        desc = parts[2].strip() if len(parts) > 2 else ""
+    else:
+        kind = "py"
+        desc = arg.split(maxsplit=1)[1].strip()
+    if not re.fullmatch(r"[\w\-]+", name) or not desc:
+        console.print(usage)
+        return
+    folder = f"apps/{name}"
+    try:
+        root = safe_path(folder)
+    except Exception as e:
+        console.print(f"[red]{e}[/]")
+        return
+    if root.exists() and any(root.iterdir()):
+        if not Confirm.ask(f"A pasta [bold]{folder}[/] já tem arquivos. Sobrescrever os de mesmo nome?", default=False):
+            return
+    spec = APP_TYPES[kind]
+    names = ", ".join([fn for fn, _ in spec["files"]] + ["README.md"])
+    console.print(Panel(f"Tipo: {spec['label']}\nPasta: {folder}/\nArquivos: {names}",
+                        title=f"📦 App {name}", border_style="#c85bff"))
+
+    made, truncated = [], []
+    for fn, system in spec["files"]:
+        ext = Path(fn).suffix.lower()
+        ctx = "".join(f"\n--- {f} ---\n{c[:1500]}\n" for f, c in made)
+        user_msg = (f"Aplicativo: {name}\nO que o app faz: {desc}\n"
+                    + (f"Arquivos já criados:{ctx}\n" if made else "")
+                    + f"Escreva agora o arquivo {fn}.")
+        console.print(f"[bold #c85bff]◆ OFFTEC[/] [#8a8fa3]gerando {fn}...[/]")
+        reply = chat_stream(
+            [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
+            num_predict=1100,
+        )
+        if not reply:
+            console.print("[yellow]Interrompido. Nada foi salvo.[/]")
+            return
+        code = strip_fences(extract_code(reply, ext))
+        if not code.strip():
+            console.print(f"[yellow]O modelo não gerou conteúdo para {fn}. Nada foi salvo.[/]")
+            return
+        made.append((fn, code))
+        if LAST["truncated"]:
+            truncated.append(fn)
+
+    problems, syntax_bad = [], False
+    for fn, code in made:
+        err = check_code(code, Path(fn).suffix.lower())
+        if err:
+            syntax_bad = True
+            problems.append(f"{fn}: erro de sintaxe — {err[:200]}")
+    for fn in truncated:
+        problems.append(f"{fn}: resposta cortada pelo limite de tamanho")
+
+    lines = "\n".join(f"• {fn}  ({code.count(chr(10))} linhas)" for fn, code in made)
+    console.print(Panel(lines, title="Arquivos gerados", border_style="#5c8dff"))
+    if problems:
+        console.print(Panel("\n".join(problems), title="⚠ Atenção", border_style="yellow"))
+    if not Confirm.ask(f"Salvar o app em [bold]{folder}/[/]?", default=not problems):
+        console.print("[#8a8fa3]Cancelado. Nada foi salvo.[/]")
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    for fn, code in made:
+        (root / fn).write_text(code, encoding="utf-8")
+    (root / "README.md").write_text(app_readme(name, desc, kind), encoding="utf-8")
+    console.print(f"[green]✔ App salvo em {root}[/]")
+    offer_editor([f"{folder}/{fn}" for fn, _ in made])
+
+    main_file = spec["files"][0][0]
+    if kind == "web":
+        if Confirm.ask("Abrir [bold]index.html[/] no navegador?", default=False):
+            open_html(f"{folder}/index.html")
+    elif not syntax_bad:
+        if Confirm.ask(f"Executar [bold]{main_file}[/] agora?", default=False):
+            tool_exec(f"{folder}/{main_file}", confirm=False)
 
 
 # ───────────────────────── Loop principal ─────────────────────────
@@ -535,6 +777,16 @@ def handle_command(cmd, history):
         sys.exit(0)
     elif c == "/ajuda":
         splash()
+    elif c == "/editar":
+        if arg:
+            cmd_editar(arg)
+        else:
+            console.print("[yellow]Uso: /editar arquivo ou pasta [vim|nano][/]")
+    elif c == "/app":
+        if arg:
+            cmd_app(arg)
+        else:
+            console.print("[yellow]Uso: /app nome [tipo] descrição  (tipos: py, web, sh, c)[/]")
     elif c == "/criar":
         if arg:
             cmd_criar(arg)
